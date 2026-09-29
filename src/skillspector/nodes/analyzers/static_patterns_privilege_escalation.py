@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import posixpath
 import re
+import shlex
 import sys
 from bisect import bisect_right
 from contextvars import ContextVar
@@ -78,6 +79,69 @@ PE1_PROSE_PATTERNS = [
     (r"(?:bypass|skip|ignore)\s+(?:permission|access)\s+(?:check|validation|restriction)", 0.85),
 ]
 PE1_PATTERNS = PE1_CODE_PATTERNS + PE1_PROSE_PATTERNS
+_CHMOD_MODE_PATTERN = (
+    r"(?<![\w-])chmod[ \t]+"
+    r"(?:(?:-[Rcfv]+|--recursive|--changes|--silent|--quiet|--verbose|"
+    r"--preserve-root|--no-preserve-root|--)[ \t]+)*"
+    # Require a plausible operand, excluding prose like "chmod is unavailable".
+    r"(?=[0-9+=\-$`'\"\\]|[ugoa]*[+=-])"
+    r"""(?P<chmod_mode>(?:'[^'\r\n]*'|"[^"\r\n]*"|\\[^\r\n]|[^\s'"\\;|&<>])+)"""
+    r"(?=$|[ \t\r\n;|&<>])"
+)
+
+
+def _chmod_sets_id_bits(raw_mode: str) -> bool | None:
+    """Classify a literal chmod operand; None means its effect is unresolved.
+
+    Track explicit setuid/setgid additions through all symbolic clauses.
+    Ordinary rwx permissions and sticky bits do not confer another identity;
+    world-writable permissions remain covered by the tool-misuse rules.
+    """
+    if len(raw_mode) > 1024:
+        return None
+    try:
+        words = shlex.split(raw_mode)
+    except ValueError:
+        return None
+    if len(words) != 1:
+        return None
+    mode = words[0]
+    if mode in {"--help", "--version"}:
+        return False
+    if re.fullmatch(r"[+=-]?[0-7]+", mode):
+        digits = mode.lstrip("+=-").lstrip("0") or "0"
+        if len(digits) > 4:
+            return None
+        return not mode.startswith("-") and bool(int(digits, 8) & 0o6000)
+
+    clauses = mode.split(",")
+    if not all(re.fullmatch(r"[ugoa]*(?:[+=-](?:[rwxXst]*|[ugo]))+", clause) for clause in clauses):
+        return None
+    enabled: set[str] = set()
+    directory_enabled: set[str] = set()
+    for clause in clauses:
+        who = re.match(r"[ugoa]*", clause)
+        assert who is not None
+        targets = set(who.group())
+        if not targets or "a" in targets:
+            targets = {"u", "g", "o"}
+        targets &= {"u", "g"}
+        for operation in re.finditer(r"([+=-])([rwxXstugo]*)", clause[who.end() :]):
+            operator, permissions = operation.groups()
+            if operator == "=" or (operator == "-" and "s" in permissions):
+                enabled -= targets
+            # GNU chmod preserves directory setid bits for '=' without 's'.
+            # https://www.gnu.org/software/coreutils/manual/html_node/Directory-Setuid-and-Setgid.html
+            if operator == "-" and "s" in permissions:
+                directory_enabled -= targets
+            if operator in {"+", "="} and "s" in permissions:
+                enabled |= targets
+                directory_enabled |= targets
+    if bool(enabled) != bool(directory_enabled):
+        return None
+    return bool(enabled)
+
+
 PE2_CODE_PATTERNS = [
     (r"sudo\s+(?!-v|-l|--version|--list)", 0.7),
     (r"sudo\s+-[isSE]", 0.8),
@@ -85,8 +149,7 @@ PE2_CODE_PATTERNS = [
     (r"su\s+-\s*$|su\s+root", 0.8),
     (r"doas\s+", 0.7),
     (r"pkexec\s+", 0.75),
-    (r"chmod\s+[ugo]*[+-=]*s", 0.85),
-    (r"chmod\s+[0-7]*[4567][0-7]{2}", 0.8),
+    (_CHMOD_MODE_PATTERN, 0.8),
 ]
 PE2_PROSE_PATTERNS = [
     (r"(?:run|execute)\s+(?:as|with)\s+root", 0.8),
@@ -902,6 +965,13 @@ def analyze(
             else re.finditer
         )
         for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            chmod_effect = (
+                _chmod_sets_id_bits(match.group("chmod_mode"))
+                if pattern == _CHMOD_MODE_PATTERN
+                else True
+            )
+            if chmod_effect is False:
+                continue
             line_num = line_number(match.start())
             context = context_at(match.start())
             finding_tags = list(tag)
@@ -910,10 +980,36 @@ def analyze(
             findings.append(
                 AnalyzerFinding(
                     rule_id="PE2",
-                    message="Sudo/Root Execution",
+                    message=(
+                        "Unresolved chmod permission change"
+                        if chmod_effect is None
+                        else "Setuid/Setgid Permission Change"
+                        if pattern == _CHMOD_MODE_PATTERN
+                        else "Sudo/Root Execution"
+                    ),
                     severity=Severity.MEDIUM,
                     location=loc(line_num),
-                    confidence=confidence,
+                    confidence=0.5 if chmod_effect is None else confidence,
+                    explanation=(
+                        "The chmod mode's setuid/setgid effect could not be resolved statically "
+                        "(dynamic, malformed, oversized or target-dependent mode). This is not proof "
+                        "of privilege escalation; inspect the mode and target permissions."
+                        if chmod_effect is None
+                        else "The chmod mode explicitly enables setuid or setgid. These bits "
+                        "can grant the file owner's or group's identity when executing a file; "
+                        "setgid on a directory controls group inheritance. Verify the target "
+                        "and intended scope."
+                        if pattern == _CHMOD_MODE_PATTERN
+                        else None
+                    ),
+                    remediation=(
+                        "Resolve the mode and review the target before applying the permission change."
+                        if chmod_effect is None
+                        else "Avoid setting setuid/setgid unless required; verify the target, "
+                        "ownership and justification for the change."
+                        if pattern == _CHMOD_MODE_PATTERN
+                        else None
+                    ),
                     tags=finding_tags,
                     context=context,
                     matched_text=match.group(0)[:200],

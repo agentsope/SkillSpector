@@ -257,6 +257,129 @@ for key, val in os.environ.items():
         assert not any(finding.rule_id == "E2" for finding in findings)
 
 
+class TestChmodPermissions:
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            "600",
+            "0644",
+            "0755",
+            "000600",
+            "0",
+            "1755",
+            "1777",
+            "'600'",
+            '"0644"',
+            "-R 0644",
+            "-- 600",
+            "--verbose 0644",
+            "u-s",
+            "g-s",
+            "a-s",
+            "u=rw,go=r",
+            "a+rX",
+            "o+s",
+            "u+g",
+            "u+s,u-s",
+            "ug+s,a-s",
+            "-4000",
+            "=0644",
+        ],
+    )
+    def test_non_escalating_modes(self, mode: str) -> None:
+        findings = privilege_escalation_module.analyze(f"chmod {mode} target", "setup.sh", "shell")
+        assert not [f for f in findings if f.rule_id == "PE2"]
+
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            "4755",
+            "2755",
+            "6755",
+            "04755",
+            "00004755",
+            "+4000",
+            "=2755",
+            "'4755'",
+            '"2755"',
+            '47"55"',
+            "-R 4755",
+            "-- 2755",
+            "--recursive 4755",
+            "u+s",
+            "g+s",
+            "a+s",
+            "+s",
+            "u=rwxs",
+            "u+r+s",
+            "u-s,g+s",
+            "'u+s,g-w'",
+            "u+s,g=u",
+            "u+s,o-s",
+        ],
+    )
+    def test_setid_modes(self, mode: str) -> None:
+        content = f"# setup\nchmod {mode} target\n"
+        findings = privilege_escalation_module.analyze(content, "setup.sh", "shell")
+        pe2 = [f for f in findings if f.rule_id == "PE2"]
+        assert len(pe2) == 1
+        assert pe2[0].location.start_line == 2
+        assert pe2[0].matched_text == f"chmod {mode}"
+        assert "Setuid/Setgid" in pe2[0].message
+
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            "$MODE",
+            '"${MODE}"',
+            "4755junk",
+            "06448",
+            "8888",
+            "10000",
+            "u+gr",
+            "u+s,garbage",
+            "u+S",
+            "--reference=other",
+            "u+s,u=rw",
+            "g+s,g=rx",
+            "0" * 1025 + "4755",
+        ],
+    )
+    def test_unresolved_modes_are_not_asserted_as_escalation(self, mode: str) -> None:
+        content = f"chmod {mode} target"
+        findings = static_runner.run_static_patterns(
+            {"components": ["setup.sh"], "file_cache": {"setup.sh": content}},
+            [privilege_escalation_module],
+        )
+        pe2 = [f for f in findings if f.rule_id == "PE2"]
+        assert len(pe2) == 1
+        assert "Unresolved" in pe2[0].message
+        assert "not proof of privilege escalation" in pe2[0].explanation
+        assert "Resolve the mode" in pe2[0].remediation
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "mychmod 4755 target",
+            "chmod\n4755 target",
+            "chmod --help",
+            "chmod --version",
+            "chmod is unavailable",
+            "Use chmod to change permissions",
+            "chmod # comment",
+        ],
+    )
+    def test_non_commands_do_not_match(self, content: str) -> None:
+        findings = privilege_escalation_module.analyze(content, "setup.sh", "shell")
+        assert not [f for f in findings if f.rule_id == "PE2"]
+
+    def test_world_writable_mode_still_has_tool_misuse_coverage(self) -> None:
+        from skillspector.nodes.analyzers import static_patterns_tool_misuse
+
+        findings = static_patterns_tool_misuse.analyze("chmod 777 target", "setup.sh", "shell")
+        assert any(f.rule_id == "TM1" for f in findings)
+
+
 class TestPrivilegeEscalation:
     """privilege_escalation.analyze() — PE3."""
 
